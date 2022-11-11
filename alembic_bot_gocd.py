@@ -163,6 +163,8 @@ def get_alembic_revision_graph(migrations_dir: str) -> Tuple[dict, str, dict]:
     if not origin_revision:
         raise Exception("no origin revision found")
 
+    graph[origin_revision] = revision_map[origin_revision]
+
     def build_graph(node: dict) -> None:
         for rev, revnode in revision_map.items():
             if node["revision"] in revnode["children"]:
@@ -171,50 +173,22 @@ def get_alembic_revision_graph(migrations_dir: str) -> Tuple[dict, str, dict]:
                     graph[revnode["revision"]] = revnode.copy()
                     build_graph(graph[revnode["revision"]])
 
-    graph[origin_revision] = revision_map[origin_revision]
     build_graph(graph[origin_revision])
-
-    # add weight to each node
-    revision_weights = {origin_revision: 0}
-    graph[origin_revision]["weight"] = 0
-
-    revisions = {origin_revision}
-    while revisions:
-        revision = revisions.pop()
-        graph[revision]["weight"] = revision_weights[revision]
-        for parent_rev in graph[revision]["parents"]:
-            if parent_rev not in revision_weights:
-                revisions.add(parent_rev)
-                revision_weights[parent_rev] = revision_weights[revision] + 1
 
     return graph, origin_revision, revision_map
 
 
-def find_head_revision(graph: dict, node: dict) -> str:
-    head_revision = None
-
-    revisions = set(node["parents"])
-    while revisions:
-        revision = revisions.pop()
-        if not graph[revision]["parents"]:
-            head_revision = graph[revision]["revision"]
-        else:
-            revisions.update(graph[revision]["parents"])
-
-    return head_revision or node["revision"]
-
-
-def find_dangling_heads(graph: dict, node: dict) -> list:
-    dangling_heads = list()
+def find_heads(graph: dict, node: dict) -> list:
+    heads = []
     processed_revisions = set()
 
     revisions = set(node["parents"]) or {node["revision"]}
     while revisions:
         revision = revisions.pop()
 
-        # if revision has no parents, it's a dangling head
+        # if revision has no parents, it's a head revision
         if not graph[revision]["parents"]:
-            dangling_heads.append(graph[revision])
+            heads.append(graph[revision])
             processed_revisions.add(revision)
             continue
 
@@ -223,9 +197,7 @@ def find_dangling_heads(graph: dict, node: dict) -> list:
                 revisions.add(parent_rev)
                 processed_revisions.add(parent_rev)
 
-    # sort by weight ascending
-    dangling_heads = list(sorted(dangling_heads, key=lambda x: x["weight"]))
-    return dangling_heads
+    return heads
 
 
 def insert_node(graph: dict, revision_map: dict, revision: str, children: tuple, parents: tuple, filepath: str) -> None:
@@ -262,6 +234,11 @@ def remove_node(graph: dict, revision_map: dict, revision: str) -> None:
     for revnode in revision_map.values():
         revnode["children"] = tuple(child for child in revnode["children"] if child != revision)
         revnode["parents"] = tuple(parent_rev for parent_rev in revnode["parents"] if parent_rev != revision)
+
+
+def alembic_name(path: str) -> str:
+    # return alembic folder name (i.e. `alembic_adjudication`) from path
+    return re.search(r"(alembic_\w+)", path).group(1)
 
 
 def git_path(path: str) -> str:
@@ -330,74 +307,7 @@ def downgrade():
         filepath=merge_heads_file,
     )
 
-    print(f"created merge heads migration: {merge_heads_file}")
-
-    slack_messages.append(f"pushed merge head migration: {git_path(merge_heads_file)}")
-
     return merge_head_revision
-
-
-def fix_dangling_revision(
-    graph: dict,
-    node: dict,
-    dangling_head: dict,
-    revision_map: dict,
-) -> Tuple[str, str]:
-    print(f"fixing dangling revision: {dangling_head}")
-
-    head_revision = find_head_revision(graph, node)
-
-    # for sequential revisions, bump merge head revision by one
-    if match := re.search(r"^(\d{5})_(.{5})$", head_revision):
-        rev_count = int(match.group(1)) + 1
-        new_head_revision = "{:05d}_{}".format(rev_count, uuid.uuid4().hex[:5])
-        filename = new_head_revision + "_" + os.path.basename(dangling_head["filepath"]).split("_", maxsplit=2)[-1]
-    else:
-        new_head_revision = format(uuid.uuid4().hex[:12])
-        filename = new_head_revision + "_" + os.path.basename(dangling_head["filepath"]).split("_", maxsplit=1)[-1]
-
-    filepath = os.path.join(os.path.dirname(dangling_head["filepath"]), filename)
-
-    # rename dangling revision file
-    os.rename(dangling_head["filepath"], filepath)
-
-    # fix revision id in renamed file
-    with open(filepath, "rb") as fp:
-        file_contents = fp.read()
-
-    new_file_contents = re.sub(
-        dangling_head["revision"].encode("utf-8"),
-        new_head_revision.encode("utf-8"),
-        file_contents,
-    )
-    new_file_contents = re.sub(
-        dangling_head["children"][0].encode("utf-8"),
-        head_revision.encode("utf-8"),
-        new_file_contents,
-    )
-
-    with open(filepath, "wb") as fp:
-        fp.write(new_file_contents)
-        fp.truncate()
-
-    execute("git", "rm", git_path(dangling_head["filepath"]))
-    execute("git", "add", git_path(filepath))
-
-    remove_node(graph=graph, revision_map=revision_map, revision=dangling_head["revision"])
-    insert_node(
-        graph=graph,
-        revision_map=revision_map,
-        revision=new_head_revision,
-        children=(head_revision,),
-        parents=(),
-        filepath=filepath,
-    )
-
-    print(f"renamed dangling migration: {dangling_head['filepath']} -> {filepath}")
-
-    slack_messages.append(f"renamed dangling migration: {git_path(dangling_head['filepath'])} -> {git_path(filepath)}")
-
-    return head_revision, new_head_revision
 
 
 def send_slack_notifications() -> None:
@@ -426,7 +336,7 @@ def send_slack_notifications() -> None:
 
     if git_head := get_current_git_head():
         pretext_parts.append("Commit: <{}|{}>".format(
-            f"https://github.com/organization/code.organization.com/commit/{git_head}",  # XXX: fix github url
+            f"https://github.com/organization/code.organization.com/commit/{git_head}",  # XXX: update github url
             git_head[:10],
         ))
 
@@ -482,47 +392,22 @@ def main() -> None:
         # get revision graph
         graph, origin_revision, revision_map = get_alembic_revision_graph(migrations_dir)
 
-        # find head revision
-        head_revision = find_head_revision(graph, graph[origin_revision])
+        # find heads
+        heads = find_heads(graph, graph[origin_revision])
 
-        # find dangling heads
-        dangling_heads = find_dangling_heads(graph, graph[origin_revision])
+        # merge heads
+        if len(heads) > 1:
+            revisions_to_merge = [rev["revision"] for rev in heads]
+            merge_head_revision = merge_heads(graph, revision_map, migrations_dir, revisions_to_merge)
 
-        # find head revision graph weight
-        head_revision_weight = None
-        for dangling_head in dangling_heads:
-            if dangling_head["revision"] == head_revision:
-                head_revision_weight = dangling_head["weight"]
-
-        if head_revision_weight is None:
-            raise Exception(f"head revision {head_revision} not found in dangling heads: {dangling_heads}")
-
-        # all dangling heads with weight equal to head revision are merge heads
-        revisions_to_merge = []
-        dangling_heads_len = len(dangling_heads)
-        for index, dangling_head in enumerate(reversed(dangling_heads)):
-            if dangling_head["weight"] == head_revision_weight:
-                merge_head_revision = dangling_heads.pop(dangling_heads_len - index - 1)
-                revisions_to_merge.append(merge_head_revision["revision"])
-
-        # create merge head migration for heads with weight equal to head revision
-        if len(revisions_to_merge) > 1:
-            merge_heads(graph, revision_map, migrations_dir, revisions_to_merge)
-            commit_messages.append("merge heads: {}".format(", ".join(revisions_to_merge)))
-
-        # fix remaining dangling heads with lower weight
-        if len(dangling_heads) > 0:
-            for dangling_head in dangling_heads:
-                _, new_revision = fix_dangling_revision(
-                    graph=graph,
-                    revision_map=revision_map,
-                    node=graph[origin_revision],
-                    dangling_head=dangling_head,
-                )
-                commit_messages.append("rename dangling revision: {} -> {}".format(
-                    dangling_head["revision"],
-                    new_revision,
-                ))
+            message = "merge heads ({}): {} -> {}".format(
+                alembic_name(migrations_dir),
+                ", ".join(revisions_to_merge),
+                merge_head_revision,
+            )
+            print(message)
+            commit_messages.append(message)
+            slack_messages.append(message)
 
     # commit to github
     if commit_messages:
@@ -581,8 +466,8 @@ def lock() -> Generator[None, None, None]:
         except botocore.exceptions.ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 wait_count += 1
-                if wait_count == 30:
-                    print("another bot still running after 300 seconds, aborting")
+                if wait_count == 90:
+                    print("another bot still running after 15 minutes, aborting")
                     sys.exit(1)
 
                 print("another bot already running, waiting...")
