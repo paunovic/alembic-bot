@@ -453,40 +453,45 @@ def main() -> None:
 def lock() -> Generator[None, None, None]:
     # use dynamodb as a lock to ensure only one instance of this bot is running at a time
     wait_count = 0
-    while True:
-        try:
-            dynamodb_client.put_item(
-                TableName="alembic_bot",
-                Item={
-                    "id": {"S": "lock"},
-                },
-                ConditionExpression="attribute_not_exists(id)",
-            )
-            break
-        except botocore.exceptions.ClientError as e:
-            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                wait_count += 1
-                if wait_count == 90:
-                    print("another bot still running after 15 minutes, aborting")
-                    sys.exit(1)
-
-                print("another bot already running, waiting...")
-                time.sleep(10)
-                continue
-
-            raise
-
     try:
+        while True:
+            try:
+                dynamodb_client.put_item(
+                    TableName="alembic_bot",
+                    Item={
+                        "id": {"S": "lock"},
+                    },
+                    ConditionExpression="attribute_not_exists(id)",
+                )
+                break
+            except botocore.exceptions.ClientError as e:
+                if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                    wait_count += 1
+                    if wait_count == 90:
+                        print("another bot still running after 15 minutes, exiting")
+                        sys.exit(0)
+
+                    print("another bot already running, waiting...")
+                    time.sleep(10)
+                    continue
+
+                raise
+
         yield
     except Exception:
         raise
     finally:
-        dynamodb_client.delete_item(
-            TableName="alembic_bot",
-            Key={
-                "id": {"S": "lock"},
-            },
-        )
+        # delete lock
+        try:
+            dynamodb_client.delete_item(
+                TableName="alembic_bot",
+                Key={
+                    "id": {"S": "lock"},
+                },
+            )
+        except botocore.exceptions.ClientError as e:
+            if e.response["Error"]["Code"] != "ResourceNotFoundException":
+                raise
 
 
 if __name__ == "__main__":
