@@ -250,19 +250,18 @@ def git_path(path: str) -> str:
 def merge_heads(graph: dict, revision_map: dict, migrations_dir: str, revisions: list) -> str:
     print(f"merging heads: {revisions}")
 
-    merge_head_revision = format(uuid.uuid4().hex[:12])
-
     # for sequential revisions, bump merge head revision by one
-    max_rev_count = 0
+    max_rev_count = -1
     for revision in revisions:
-        match = re.search(r"^(\d{5})_(.{5})$", revision)
-        if not match:
-            break
-        rev_count = int(match.group(1))
-        if rev_count > max_rev_count:
-            max_rev_count = rev_count
-    else:
+        if match := re.search(r"^(\d{5})_(.{5})$", revision):
+            rev_count = int(match.group(1))
+            if rev_count > max_rev_count:
+                max_rev_count = rev_count
+
+    if max_rev_count != -1:
         merge_head_revision = "{:05d}_{}".format(max_rev_count + 1, uuid.uuid4().hex[:5])
+    else:
+        merge_head_revision = uuid.uuid4().hex[:12]
 
     merge_heads_file_contents: str = """\"\"\"merge heads
 
@@ -450,7 +449,7 @@ def main() -> None:
 
 
 @contextmanager
-def lock() -> Generator[None, None, None]:
+def lock() -> Generator:
     # use dynamodb as a lock to ensure only one instance of this bot is running at a time
     wait_count = 0
     try:
